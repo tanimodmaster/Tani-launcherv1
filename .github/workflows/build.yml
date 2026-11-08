@@ -1,28 +1,97 @@
 name: Build Tani Launcher
-on: [push, workflow_dispatch]
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/AngelAuraMC/Amethyst-iOS
+  UPSTREAM_REF: f98c4133c72d39e06ceac42b57cc4477c52105fc
+
 jobs:
   build:
-    runs-on:  macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 90
     steps:
+      - name: Checkout Tani Launcher
+        uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
           java-version: '8'
-      - run: brew install make ldid cmake
-      - name: Get launcher code
-        run: git clone --recursive --depth 1 https://github.com/AngelAuraMC/Amethyst-iOS src
+
+      - name: Install build tools
+        run: brew install make ldid cmake
+
+      - name: Find Tani files
+        run: |
+          d=$(dirname "$(find . -path ./src -prune -o -path '*/tani/rebrand.sh' -print | head -1)")
+          [ -n "$d" ] && [ "$d" != "." ] || { echo "::error::tani/ folder not found"; exit 1; }
+          echo "TANI_DIR=$GITHUB_WORKSPACE/${d#./}" >> "$GITHUB_ENV"
+          echo "Using $d"
+
+      - name: Get launcher source
+        run: |
+          git init src
+          cd src
+          git remote add origin "$UPSTREAM_REPO"
+          git fetch --depth 1 origin "$UPSTREAM_REF"
+          git checkout -q FETCH_HEAD
+          git checkout -q -b main
+          git submodule update --init --recursive --depth 1
+
+      - name: Apply Tani Launcher changes (built-in Fabric)
+        working-directory: src
+        run: git apply --verbose "$TANI_DIR/tani-fabric.patch"
+
       - name: Rebrand to Tani Launcher
         working-directory: src
-        run: |
-          perl -pi -e 's/org\.angelauramc\.amethyst/com.tani.launcher/g' Natives/Info.plist entitlements.*.xml Makefile
-          find Natives/resources -name '*.strings' -exec perl -pi -e 's/Angel Aura Amethyst/Tani Launcher/g; s/\bAmethyst\b/Tani Launcher/g' {} +
-          perl -pi -e 's/Angel Aura Amethyst/Tani Launcher/g; s/\bAmethyst\b/Tani Launcher/g' Natives/Info.plist
-      - name: Build
+        run: bash "$TANI_DIR/rebrand.sh"
+
+      - name: Download Java runtimes
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash "$TANI_DIR/fetch-jres.sh"
+
+      - name: Build IPA
         working-directory: src
         run: |
           export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
           gmake -j$(sysctl -n hw.ncpu) package PLATFORM=2 BOOTJDK="$JAVA_HOME/bin"
-      - uses: actions/upload-artifact@v4
+          gmake package PLATFORM=2 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1 || echo "::warning::TrollStore build failed"
+          ls -la artifacts
+
+      - name: Rename outputs
+        working-directory: src/artifacts
+        run: |
+          ipa=$(ls *.ipa | grep -v trollstore | head -1)
+          cp "$ipa" ../../TaniLauncher.ipa
+          tipa=$(ls *trollstore.tipa 2>/dev/null | head -1 || true)
+          [ -n "$tipa" ] && cp "$tipa" ../../TaniLauncher-TrollStore.tipa || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: TaniLauncher-ipa
-          path: src/artifacts/*.ipa
+          name: TaniLauncher
+          path: |
+            TaniLauncher.ipa
+            TaniLauncher-TrollStore.tipa
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Tani Launcher (build ${{ github.run_number }})
+          body: |
+            Unsigned IPA - sideload with SideStore, AltStore, Sideloadly or TrollStore (use the .tipa for TrollStore).
+            JIT must be enabled (e.g. StikDebug) for Minecraft to run.
+          files: |
+            TaniLauncher.ipa
+            TaniLauncher-TrollStore.tipa
