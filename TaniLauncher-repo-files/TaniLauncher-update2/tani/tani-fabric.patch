@@ -1,0 +1,196 @@
+diff --git a/Natives/LauncherProfilesViewController.m b/Natives/LauncherProfilesViewController.m
+index f15b10d..2ba6d94 100644
+--- a/Natives/LauncherProfilesViewController.m
++++ b/Natives/LauncherProfilesViewController.m
+@@ -13,6 +13,7 @@
+ #pragma clang diagnostic pop
+ #import "UIKit+hook.h"
+ #import "installer/FabricInstallViewController.h"
++#import "installer/FabricUtils.h"
+ #import "installer/ForgeInstallViewController.h"
+ #import "installer/ModpackInstallViewController.h"
+ #import "ios_uikit_bridge.h"
+@@ -59,6 +60,11 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
+             actionWithTitle:@"OptiFine" image:nil
+             identifier:@"optifine" handler:createHandler],
+ #endif
++        [UIAction
++            actionWithTitle:@"Fabric (Latest, 1-tap)" image:nil
++            identifier:@"fabric_latest" handler:^(UIAction *action) {
++                [self actionCreateLatestFabricProfile];
++            }],
+         [UIAction
+             actionWithTitle:@"Fabric/Quilt" image:nil
+             identifier:@"fabric_or_quilt" handler:^(UIAction *action) {
+@@ -103,6 +109,20 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
+     toggleIsolatedPref(sender.isOn);
+ }
+ 
++- (void)actionCreateLatestFabricProfile {
++    self.createButtonItem.enabled = NO;
++    [FabricUtils installLatestFabricProfileSelect:YES completion:^(NSString *name, NSError *error) {
++        self.createButtonItem.enabled = YES;
++        if (error) {
++            showDialog(localize(@"Error", nil), error.localizedDescription);
++            return;
++        }
++        [PLProfiles updateCurrent];
++        [self.tableView reloadData];
++        [self.navigationController performSelector:@selector(reloadProfileList)];
++    }];
++}
++
+ - (void)actionCreateFabricProfile {
+     FabricInstallViewController *vc = [FabricInstallViewController new];
+     [self presentNavigatedViewController:vc];
+diff --git a/Natives/PLProfiles.m b/Natives/PLProfiles.m
+index b2a29e2..30c6df6 100644
+--- a/Natives/PLProfiles.m
++++ b/Natives/PLProfiles.m
+@@ -1,6 +1,7 @@
+ #import "LauncherPreferences.h"
+ #import "PLProfiles.h"
+ #import "utils.h"
++#import "installer/FabricUtils.h"
+ 
+ static PLProfiles* current;
+ 
+@@ -10,13 +11,14 @@ static PLProfiles* current;
+ @implementation PLProfiles
+ 
+ + (id)defaultProfiles {
++    // Mutable all the way down so profiles can be added before the first reload
+     return @{
+         @"profiles": @{
+             @"(Default)": @{
+                 @"name": @"(Default)",
+                 @"lastVersionId": @"latest-release"
+-            }
+-        },
++            }.mutableCopy
++        }.mutableCopy,
+         @"selectedProfile": @"(Default)"
+     }.mutableCopy;
+ }
+@@ -67,6 +69,10 @@ static PLProfiles* current;
+     if (self.profileDict[@"NSErrorObject"]) {
+         self.profileDict = PLProfiles.defaultProfiles;
+         [self save];
++        // Tani Launcher: built-in Fabric. Set up a ready-to-play Fabric profile on first run.
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [FabricUtils installLatestFabricProfileSelect:YES completion:nil];
++        });
+     }
+ 
+     return self;
+diff --git a/Natives/installer/FabricUtils.h b/Natives/installer/FabricUtils.h
+index 636985e..5126aba 100644
+--- a/Natives/installer/FabricUtils.h
++++ b/Natives/installer/FabricUtils.h
+@@ -4,4 +4,9 @@
+ 
+ + (NSDictionary *)endpoints;
+ 
++// Tani Launcher: built-in Fabric.
++// Fetches the latest stable Minecraft + Fabric loader, writes the version json
++// and adds/selects a "Fabric <version>" profile. Completion runs on the main queue.
+++ (void)installLatestFabricProfileSelect:(BOOL)select completion:(void (^)(NSString *profileName, NSError *error))completion;
++
+ @end
+diff --git a/Natives/installer/FabricUtils.m b/Natives/installer/FabricUtils.m
+index ba120cb..b61c990 100644
+--- a/Natives/installer/FabricUtils.m
++++ b/Natives/installer/FabricUtils.m
+@@ -1,4 +1,6 @@
+ #import "FabricUtils.h"
++#import "PLProfiles.h"
++#import "utils.h"
+ 
+ @implementation FabricUtils
+ 
+@@ -19,4 +21,85 @@
+     };
+ }
+ 
+++ (void)tani_getJSON:(NSString *)url completion:(void (^)(id json, NSError *error))completion {
++    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithURL:[NSURL URLWithString:url]
++    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
++        id json = nil;
++        if (!error && data) {
++            json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&error];
++        }
++        completion(json, error);
++    }];
++    [task resume];
++}
++
+++ (NSString *)tani_firstStable:(NSArray *)list {
++    if (![list isKindOfClass:NSArray.class]) return nil;
++    for (NSDictionary *v in list) {
++        if ([v[@"stable"] boolValue] && v[@"version"]) return v[@"version"];
++    }
++    return nil;
++}
++
+++ (void)installLatestFabricProfileSelect:(BOOL)select completion:(void (^)(NSString *, NSError *))completion {
++    NSDictionary *endpoint = self.endpoints[@"Fabric"];
++    void (^fail)(NSError *) = ^(NSError *error) {
++        if (!error) {
++            error = [NSError errorWithDomain:@"TaniLauncher" code:1
++                userInfo:@{NSLocalizedDescriptionKey: @"Could not get Fabric version list"}];
++        }
++        NSLog(@"[Tani] Fabric auto-install failed: %@", error);
++        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, error); });
++    };
++
++    [self tani_getJSON:endpoint[@"game"] completion:^(id games, NSError *error) {
++        NSString *gameVersion = [self tani_firstStable:games];
++        // Newer Minecraft (1.20.5+) needs Java 21. If this build has no Java 21
++        // runtime, pick the newest version that runs on Java 17 instead.
++        NSString *java21 = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"java_runtimes/java-21-openjdk"];
++        NSString *java21Imported = [NSString stringWithFormat:@"%s/java_runtimes/java-21-openjdk", getenv("AME_HOME")];
++        BOOL hasJava21 = [NSFileManager.defaultManager fileExistsAtPath:java21] ||
++            (getenv("AME_HOME") && [NSFileManager.defaultManager fileExistsAtPath:java21Imported]);
++        if (!hasJava21 && [games isKindOfClass:NSArray.class]) {
++            for (NSDictionary *g in games) {
++                if ([g[@"version"] isEqualToString:@"1.20.4"]) { gameVersion = @"1.20.4"; break; }
++            }
++        }
++        if (!gameVersion) { fail(error); return; }
++        [self tani_getJSON:endpoint[@"loader"] completion:^(id loaders, NSError *error) {
++            NSString *loaderVersion = [self tani_firstStable:loaders];
++            if (!loaderVersion) { fail(error); return; }
++            NSString *url = [NSString stringWithFormat:endpoint[@"json"], gameVersion, loaderVersion];
++            [self tani_getJSON:url completion:^(id profileJSON, NSError *error) {
++                if (![profileJSON isKindOfClass:NSDictionary.class] || !profileJSON[@"id"]) { fail(error); return; }
++                dispatch_async(dispatch_get_main_queue(), ^{
++                    NSString *versionId = profileJSON[@"id"];
++                    NSString *jsonPath = [NSString stringWithFormat:@"%1$s/versions/%2$@/%2$@.json", getenv("GAME_DIR"), versionId];
++                    [NSFileManager.defaultManager createDirectoryAtPath:jsonPath.stringByDeletingLastPathComponent
++                        withIntermediateDirectories:YES attributes:nil error:nil];
++                    NSError *saveError = saveJSONToFile(profileJSON, jsonPath);
++                    if (saveError) { fail(saveError); return; }
++
++                    NSString *name = [NSString stringWithFormat:@"Fabric %@", gameVersion];
++                    PLProfiles *profiles = PLProfiles.current;
++                    if (!profiles.profiles[name]) {
++                        profiles.profiles[name] = @{
++                            @"name": name,
++                            @"icon": endpoint[@"icon"],
++                            @"lastVersionId": versionId
++                        }.mutableCopy;
++                    }
++                    if (select) {
++                        profiles.selectedProfileName = name; // also saves
++                    } else {
++                        [profiles save];
++                    }
++                    NSLog(@"[Tani] Built-in Fabric profile ready: %@ (%@)", name, versionId);
++                    if (completion) completion(name, nil);
++                });
++            }];
++        }];
++    }];
++}
++
+ @end
