@@ -1,0 +1,28 @@
+name: Build Tani Launcher
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '8'
+      - run: brew install make ldid cmake
+      - name: Get launcher code
+        run: git clone --recursive --depth 1 https://github.com/AngelAuraMC/Amethyst-iOS src
+      - name: Rebrand to Tani Launcher
+        working-directory: src
+        run: |
+          perl -pi -e 's/org\.angelauramc\.amethyst/com.tani.launcher/g' Natives/Info.plist entitlements.*.xml Makefile
+          find Natives/resources -name '*.strings' -exec perl -pi -e 's/Angel Aura Amethyst/Tani Launcher/g; s/\bAmethyst\b/Tani Launcher/g' {} +
+          perl -pi -e 's/Angel Aura Amethyst/Tani Launcher/g; s/\bAmethyst\b/Tani Launcher/g' Natives/Info.plist
+      - name: Build
+        working-directory: src
+        run: |
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          gmake -j$(sysctl -n hw.ncpu) package PLATFORM=2 BOOTJDK="$JAVA_HOME/bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TaniLauncher-ipa
+          path: src/artifacts/*.ipa
